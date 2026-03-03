@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Body
 from PIL import Image
 import os
 import numpy as np
@@ -7,6 +7,7 @@ import json
 
 from backend.models.age_model import AgePredictor
 from backend.models.face_model import FaceEmbedder
+from backend.models.guardian_model import GuardianModel
 from backend.db.supabase_client import supabase
 from backend.services.trust_service import (
     insert_signal,
@@ -280,3 +281,29 @@ async def verify_login(user_id: str = Form(...), file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+# ########################## GUARDIAN MODEL - POST,CAPTION,BIO ##########################
+
+guardian = GuardianModel()
+
+@app.post("/analyze-text")
+async def analyze_text(
+    user_id: str,
+    text: str = Body(...)
+):
+    try:
+        result = guardian.predict_text(text)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "predicted_label": result["predicted_label"],
+            "confidence": result["confidence"],
+            "probabilities": result["probabilities"]
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
