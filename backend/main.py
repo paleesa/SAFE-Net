@@ -17,6 +17,7 @@ from backend.services.trust_service import (
     SEC_SIGNAL_LOGIN_MATCH,
     SEC_SIGNAL_LOGIN_FAIL,
 )
+from backend.schemas.guardian import AnalyzeTextRequest
 
 app = FastAPI(title="FYP Trust Platform API")
 
@@ -26,8 +27,9 @@ PROJECT_ROOT = os.path.dirname(BASE_DIR)                       # .../fyp-backend
 CKPT_PATH = os.path.join(PROJECT_ROOT, "age_resnet50_utkface.pt")
 
 predictor = AgePredictor(CKPT_PATH)
-
 embedder = FaceEmbedder()
+guardian = GuardianModel()
+
 DB_PATH = "embeddings.json"
 
 def load_db():
@@ -283,27 +285,84 @@ async def verify_login(user_id: str = Form(...), file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
     
 # ########################## GUARDIAN MODEL - POST,CAPTION,BIO ##########################
+def guardian_signal(predicted_label: str, confidence: float):
+    if confidence >= 0.85:
+        delta = 8
+    elif confidence >= 0.70:
+        delta = 4
+    elif confidence >= 0.60:
+        delta = 2
+    else:
+        delta = 0
 
-guardian = GuardianModel()
+    if predicted_label == "minor":
+        return -delta, "NLP_MINOR"
+    return +delta, "NLP_ADULT"
 
 @app.post("/analyze-text")
-async def analyze_text(
-    user_id: str,
-    text: str = Body(...)
-):
+async def analyze_text(req: AnalyzeTextRequest):
     try:
-        result = guardian.predict_text(text)
+        # 1) run guardian
+        result = guardian.predict_text(req.text)
+        label = result["predicted_label"]
+        conf = float(result["confidence"])
+
+        # 2) convert to signal
+        signal_val, signal_type = guardian_signal(label, conf)
+
+        # 3) insert signal (for now source_id can be None)
+        insert_signal(
+            user_id=req.user_id,
+            source_type=req.source_type,
+            source_id=req.source_id,   # may be None
+            signal_type=signal_type,
+            signal_value=float(signal_val),
+            ai_label=label
+        )
+
+        # 4) recalc scores
+        age_score, security_score = update_scores(req.user_id)
+
+        # 5) fetch predicted_age for access decision
+        ui = (
+            supabase.table("user_identity")
+            .select("predicted_age")
+            .eq("user_id", req.user_id)
+            .single()
+            .execute()
+        )
+        predicted_age = ui.data.get("predicted_age") if ui.data else None
+
+        # if user not registered via face yet
+        if predicted_age is None:
+            return {
+                "ok": True,
+                "note": "No predicted_age in user_identity yet; signal recorded and scores updated.",
+                "predicted_label": label,
+                "confidence": conf,
+                "signal_type": signal_type,
+                "signal_value": signal_val,
+                "trust_score": age_score,
+                "security_score": security_score
+            }
+
+        # 6) update access status using your existing logic
+        status = update_access_status(req.user_id, float(predicted_age), confidence=conf)
 
         return {
             "ok": True,
-            "user_id": user_id,
-            "predicted_label": result["predicted_label"],
-            "confidence": result["confidence"],
-            "probabilities": result["probabilities"]
+            "user_id": req.user_id,
+            "source_type": req.source_type,
+            "predicted_label": label,
+            "confidence": conf,
+            "signal_type": signal_type,
+            "signal_value": signal_val,
+            "trust_score": round(age_score, 2),
+            "security_score": round(security_score, 2),
+            "access_status": status
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
