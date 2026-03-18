@@ -18,6 +18,9 @@ from backend.services.trust_service import (
     SEC_SIGNAL_LOGIN_FAIL,
 )
 from backend.schemas.guardian import AnalyzeTextRequest
+from backend.schemas.post import CreatePostRequest
+from backend.schemas.comment import CreateCommentRequest
+from backend.schemas.bio import UpdateBioRequest
 
 app = FastAPI(title="FYP Trust Platform API")
 
@@ -321,17 +324,25 @@ async def analyze_text(req: AnalyzeTextRequest):
         )
 
         # 4) recalc scores
-        age_score, security_score = update_scores(req.user_id)
+        age_score, security_score = update_scores(
+            req.user_id,
+            reason=f"{signal_type}:{label}:{conf:.2f}"
+        )
 
         # 5) fetch predicted_age for access decision
-        ui = (
+        ui_res = (
             supabase.table("user_identity")
             .select("predicted_age")
             .eq("user_id", req.user_id)
             .single()
             .execute()
         )
-        predicted_age = ui.data.get("predicted_age") if ui.data else None
+        if not ui_res.data:
+            raise HTTPException(status_code=404, detail="user_identity not found for this user")
+
+        predicted_age = ui_res.data.get("predicted_age")
+        # if predicted_age is None:
+        #     raise HTTPException(status_code=400, detail="predicted_age is missing in user_identity")
 
         # if user not registered via face yet
         if predicted_age is None:
@@ -347,12 +358,260 @@ async def analyze_text(req: AnalyzeTextRequest):
             }
 
         # 6) update access status using your existing logic
-        status = update_access_status(req.user_id, float(predicted_age), confidence=conf)
+        status = update_access_status(req.user_id, predicted_age=float(predicted_age), confidence=conf)
 
         return {
             "ok": True,
             "user_id": req.user_id,
             "source_type": req.source_type,
+            "predicted_label": label,
+            "confidence": conf,
+            "signal_type": signal_type,
+            "signal_value": signal_val,
+            "trust_score": round(age_score, 2),
+            "security_score": round(security_score, 2),
+            "access_status": status
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+@app.post("/create-post")
+async def create_post(req: CreatePostRequest):
+    try:
+        # 1️⃣ Save post first
+        post_res = supabase.table("post").insert({
+            "user_id": req.user_id,
+            "caption_text": req.caption_text,
+            "media_url": req.media_url
+        }).execute()
+
+        if not post_res.data:
+            raise HTTPException(status_code=500, detail="Failed to save post")
+
+        post_id = post_res.data[0]["post_id"]
+
+        # 2️⃣ Run Guardian on caption text
+        result = guardian.predict_text(req.caption_text)
+        label = result["predicted_label"]
+        conf = float(result["confidence"])
+
+        # 3️⃣ Convert Guardian output into trust signal
+        signal_val, signal_type = guardian_signal(label, conf)
+
+        # 4️⃣ Insert signal into trust_score_signals
+        insert_signal(
+            user_id=req.user_id,
+            source_type="post",
+            source_id=post_id,
+            signal_type=signal_type,
+            signal_value=signal_val,
+            ai_label=label
+        )
+
+        # 5️⃣ Update age/security scores
+        age_score, security_score = update_scores(
+            req.user_id,
+            reason=f"{signal_type}:{label}:{conf:.2f}"
+        )
+
+        # 6️⃣ Fetch predicted_age for access status update
+        ui_res = (
+            supabase.table("user_identity")
+            .select("predicted_age")
+            .eq("user_id", req.user_id)
+            .single()
+            .execute()
+        )
+
+        if not ui_res.data:
+            raise HTTPException(status_code=404, detail="user_identity not found")
+
+        predicted_age = ui_res.data.get("predicted_age")
+        if predicted_age is None:
+            raise HTTPException(status_code=400, detail="predicted_age missing in user_identity")
+
+        # 7️⃣ Update access status
+        status = update_access_status(
+            req.user_id,
+            predicted_age=float(predicted_age),
+            confidence=conf
+        )
+
+        return {
+            "ok": True,
+            "post_id": post_id,
+            "predicted_label": label,
+            "confidence": conf,
+            "signal_type": signal_type,
+            "signal_value": signal_val,
+            "trust_score": round(age_score, 2),
+            "security_score": round(security_score, 2),
+            "access_status": status
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+@app.post("/create-comment")
+async def create_comment(req: CreateCommentRequest):
+    try:
+        # 1️⃣ Save comment first
+        comment_res = supabase.table("comment").insert({
+            "user_id": req.user_id,
+            "post_id": req.post_id,
+            "comment_text": req.comment_text
+        }).execute()
+
+        if not comment_res.data:
+            raise HTTPException(status_code=500, detail="Failed to save comment")
+
+        comment_id = comment_res.data[0]["comment_id"]
+
+        # 2️⃣ Run Guardian on comment text
+        result = guardian.predict_text(req.comment_text)
+        label = result["predicted_label"]
+        conf = float(result["confidence"])
+
+        # 3️⃣ Convert Guardian output into trust signal
+        signal_val, signal_type = guardian_signal(label, conf)
+
+        # 4️⃣ Insert trust signal
+        insert_signal(
+            user_id=req.user_id,
+            source_type="comment",
+            source_id=comment_id,
+            signal_type=signal_type,
+            signal_value=signal_val,
+            ai_label=label
+        )
+
+        # 5️⃣ Recalculate scores
+        age_score, security_score = update_scores(
+            req.user_id,
+            reason=f"{signal_type}:{label}:{conf:.2f}"
+        )
+
+        # 6️⃣ Fetch predicted_age for access status update
+        ui_res = (
+            supabase.table("user_identity")
+            .select("predicted_age")
+            .eq("user_id", req.user_id)
+            .single()
+            .execute()
+        )
+
+        if not ui_res.data:
+            raise HTTPException(status_code=404, detail="user_identity not found")
+
+        predicted_age = ui_res.data.get("predicted_age")
+        if predicted_age is None:
+            raise HTTPException(status_code=400, detail="predicted_age missing in user_identity")
+
+        # 7️⃣ Update access status
+        status = update_access_status(
+            req.user_id,
+            predicted_age=float(predicted_age),
+            confidence=conf
+        )
+
+        return {
+            "ok": True,
+            "comment_id": comment_id,
+            "predicted_label": label,
+            "confidence": conf,
+            "signal_type": signal_type,
+            "signal_value": signal_val,
+            "trust_score": round(age_score, 2),
+            "security_score": round(security_score, 2),
+            "access_status": status
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+@app.put("/update-bio")
+async def update_bio(req: UpdateBioRequest):
+    try:
+        # 1️⃣ Check if bio already exists
+        existing = (
+            supabase.table("bio")
+            .select("bio_id")
+            .eq("user_id", req.user_id)
+            .execute()
+        )
+
+        if existing.data:
+            # UPDATE
+            bio_id = existing.data[0]["bio_id"]
+
+            supabase.table("bio").update({
+                "bio_text": req.bio_text
+            }).eq("bio_id", bio_id).execute()
+
+        else:
+            # INSERT
+            bio_res = supabase.table("bio").insert({
+                "user_id": req.user_id,
+                "bio_text": req.bio_text
+            }).execute()
+
+            bio_id = bio_res.data[0]["bio_id"]
+
+        # 2️⃣ Run Guardian
+        result = guardian.predict_text(req.bio_text)
+        label = result["predicted_label"]
+        conf = float(result["confidence"])
+
+        # 3️⃣ Convert → signal
+        signal_val, signal_type = guardian_signal(label, conf)
+
+        # 4️⃣ Insert trust signal
+        insert_signal(
+            user_id=req.user_id,
+            source_type="bio",
+            source_id=bio_id,
+            signal_type=signal_type,
+            signal_value=signal_val,
+            ai_label=label
+        )
+
+        # 5️⃣ Update scores
+        age_score, security_score = update_scores(
+            req.user_id,
+            reason=f"{signal_type}:{label}:{conf:.2f}"
+        )
+
+        # 6️⃣ Get predicted_age
+        ui_res = (
+            supabase.table("user_identity")
+            .select("predicted_age")
+            .eq("user_id", req.user_id)
+            .single()
+            .execute()
+        )
+
+        if not ui_res.data:
+            raise HTTPException(status_code=404, detail="user_identity not found")
+
+        predicted_age = ui_res.data.get("predicted_age")
+
+        # 7️⃣ Update access status
+        status = update_access_status(
+            req.user_id,
+            predicted_age=float(predicted_age),
+            confidence=conf
+        )
+
+        return {
+            "ok": True,
+            "bio_id": bio_id,
             "predicted_label": label,
             "confidence": conf,
             "signal_type": signal_type,
