@@ -4,6 +4,7 @@ import os
 import numpy as np
 import cv2
 import json
+import re
 
 from backend.models.age_model import AgePredictor
 from backend.models.face_model import FaceEmbedder
@@ -17,10 +18,13 @@ from backend.services.trust_service import (
     SEC_SIGNAL_LOGIN_MATCH,
     SEC_SIGNAL_LOGIN_FAIL,
 )
+from datetime import datetime, date
 from backend.schemas.guardian import AnalyzeTextRequest
 from backend.schemas.post import CreatePostRequest
 from backend.schemas.comment import CreateCommentRequest
 from backend.schemas.bio import UpdateBioRequest
+from backend.schemas.message import SendMessageRequest
+from backend.schemas.ekyc import SubmitEKYCRequest
 
 app = FastAPI(title="FYP Trust Platform API")
 
@@ -619,6 +623,371 @@ async def update_bio(req: UpdateBioRequest):
             "trust_score": round(age_score, 2),
             "security_score": round(security_score, 2),
             "access_status": status
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+# ########################## ENFORCEMENT - ACCESS STATUS ##########################################
+
+def get_permissions_from_status(access_status: str):
+    if access_status == "verified":
+        return {
+            "can_post": True,
+            "can_comment": True,
+            "can_dm": True,
+            "can_join_group_chat": True,
+            "can_follow_only_verified": False,
+            "content_filter_enabled": False
+        }
+
+    elif access_status == "under_review":
+        return {
+            "can_post": True,
+            "can_comment": True,
+            "can_dm": True,
+            "can_join_group_chat": True,
+            "can_follow_only_verified": False,
+            "content_filter_enabled": True
+        }
+
+    elif access_status == "restricted":
+        return {
+            "can_post": True,
+            "can_comment": True,
+            "can_dm": False,
+            "can_join_group_chat": False,
+            "can_follow_only_verified": True,
+            "content_filter_enabled": True
+        }
+
+    else:
+        return {
+            "can_post": False,
+            "can_comment": False,
+            "can_dm": False,
+            "can_join_group_chat": False,
+            "can_follow_only_verified": True,
+            "content_filter_enabled": True
+        }
+
+
+def get_user_permissions(user_id: str):
+    res = (
+        supabase.table("user_identity")
+        .select("access_status, trust_score, security_score")
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="user_identity not found")
+
+    access_status = res.data.get("access_status", "under_review")
+    permissions = get_permissions_from_status(access_status)
+
+    return {
+        "access_status": access_status,
+        "trust_score": res.data.get("trust_score"),
+        "security_score": res.data.get("security_score"),
+        "permissions": permissions
+    }
+@app.get("/user-access/{user_id}")
+async def user_access(user_id: str):
+    try:
+        result = get_user_permissions(user_id)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "access_status": result["access_status"],
+            "trust_score": result["trust_score"],
+            "security_score": result["security_score"],
+            "permissions": result["permissions"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+##################### SEND MESSAGE (ENFORCE DM RESTRICTION) #####################
+@app.post("/send-message")
+async def send_message(req: SendMessageRequest):
+    try:
+        sender_info = get_user_permissions(req.sender_id)
+
+        if not sender_info["permissions"]["can_dm"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Direct messaging is not allowed for this account."
+            )
+
+        # For now we only simulate success
+        # Later you can save into a real message table
+        return {
+            "ok": True,
+            "message": "Message allowed and would be sent.",
+            "sender_id": req.sender_id,
+            "receiver_id": req.receiver_id,
+            "access_status": sender_info["access_status"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+@app.post("/join-group-chat/{user_id}")
+async def join_group_chat(user_id: str):
+    try:
+        user_info = get_user_permissions(user_id)
+
+        if not user_info["permissions"]["can_join_group_chat"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Group chat is not allowed for this account."
+            )
+
+        return {
+            "ok": True,
+            "message": "User is allowed to join group chat.",
+            "user_id": user_id,
+            "access_status": user_info["access_status"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+    
+############## EKYC #################
+
+def extract_dob(text: str):
+    """
+    Try to extract DOB from OCR text.
+    Supports common formats like:
+    14/08/2008
+    14-08-2008
+    2008-08-14
+    """
+    patterns = [
+        r'(\d{2}[/-]\d{2}[/-]\d{4})',
+        r'(\d{4}[/-]\d{2}[/-]\d{2})'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            dob_str = match.group(1)
+
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(dob_str, fmt).date()
+                except ValueError:
+                    continue
+
+    return None
+
+# Update status based on EKYC result
+def calculate_age(dob: date) -> int:
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+def apply_ekyc_decision(user_id: str, real_age: int):
+    # 1) Get old scores first
+    res = (
+        supabase.table("user_identity")
+        .select("trust_score, security_score")
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+
+    old_age_score = float(res.data.get("trust_score", 50.0))
+    old_security_score = float(res.data.get("security_score", 50.0))
+
+    # 2) Decide new values
+    if real_age >= 16:
+        status = "verified"
+        new_age_score = 100.0
+    else:
+        status = "restricted"
+        new_age_score = 0.0
+
+    # keep security score unchanged
+    new_security_score = old_security_score
+
+    # 3) Update user_identity
+    supabase.table("user_identity").update({
+        "access_status": status,
+        "trust_score": new_age_score,
+        "security_score": new_security_score
+    }).eq("user_id", user_id).execute()
+
+    return {
+        "status": status,
+        "old_age_score": old_age_score,
+        "new_age_score": new_age_score,
+        "old_security_score": old_security_score,
+        "new_security_score": new_security_score
+    }
+
+@app.post("/submit-ekyc")
+async def submit_ekyc(req: SubmitEKYCRequest):
+    try:
+        # 1️⃣ Extract DOB
+        dob = extract_dob(req.extracted_text)
+
+        if dob is None:
+            raise HTTPException(status_code=400, detail="DOB could not be extracted")
+
+        real_age = calculate_age(dob)
+
+        # 2️⃣ Create verification_attempt FIRST
+        va_res = supabase.table("verification_attempt").insert({
+            "user_id": req.user_id,
+            "method": "ekyc",
+            "result_status": "success",
+            "result_predicted_age": float(real_age),
+            "result_confidence": 1.00,
+            "result_trust_score": None
+        }).execute()
+
+        attempt_id = va_res.data[0]["attempt_id"]
+
+        # 3️⃣ Insert into ekyc_data
+        ekyc_res = supabase.table("ekyc_data").insert({
+            "verification_attempt_id": attempt_id,
+            "id_card_front_image_url": req.front_image_url,
+            "id_card_back_image_url": req.back_image_url,
+            "extracted_dob": str(dob),
+            "is_success": True
+        }).execute()
+
+        ekyc_id = ekyc_res.data[0]["ekyc_id"]
+
+        # 4️⃣ Insert strong signal
+        if real_age >= 16:
+            signal_value = 100.0
+            label = "ekyc_adult"
+        else:
+            signal_value = -100.0
+            label = "ekyc_minor"
+
+        insert_signal(
+            user_id=req.user_id,
+            source_type="ekyc",
+            source_id=ekyc_id,
+            signal_type="EKYC_RESULT",
+            signal_value=signal_value,
+            ai_label=label
+        )
+
+        # 5️⃣ Apply hard override
+        decision = apply_ekyc_decision(req.user_id, real_age)
+
+        # 6️⃣ Insert trust history
+        supabase.table("trust_score_history").insert({
+            "user_id": req.user_id,
+            "old_score": round(decision["old_age_score"], 2),
+            "new_score": round(decision["new_age_score"], 2),
+            "score_type": "AGE",
+            "reason": "EKYC_VERIFIED_ADULT" if real_age >= 16 else "EKYC_VERIFIED_MINOR"
+        }).execute()
+
+        return {
+            "ok": True,
+            "ekyc_id": ekyc_id,
+            "attempt_id": attempt_id,
+            "dob_extracted": str(dob),
+            "real_age": real_age,
+            "access_status": decision["status"],
+            "trust_score": decision["new_age_score"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+########################### USER PROFILE STATUS - ALL DATA (FOR DEBUGGING) ##########################
+    
+@app.get("/user-profile-status/{user_id}")
+async def user_profile_status(user_id: str):
+    try:
+        # 1) user identity
+        ui_res = (
+            supabase.table("user_identity")
+            .select("user_id, access_status, predicted_age, trust_score, security_score, confidence_score, last_verification")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+
+        if not ui_res.data:
+            raise HTTPException(status_code=404, detail="user_identity not found")
+
+        identity = ui_res.data
+        access_status = identity.get("access_status", "under_review")
+        permissions = get_permissions_from_status(access_status)
+
+        # 2) latest verification attempt
+        va_res = (
+            supabase.table("verification_attempt")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest_verification = va_res.data[0] if va_res.data else None
+
+        # 3) latest eKYC (through latest verification attempt if method=ekyc)
+        latest_ekyc = None
+        if latest_verification and latest_verification.get("method") == "ekyc":
+            attempt_id = latest_verification["attempt_id"]
+            ekyc_res = (
+                supabase.table("ekyc_data")
+                .select("*")
+                .eq("verification_attempt_id", attempt_id)
+                .limit(1)
+                .execute()
+            )
+            latest_ekyc = ekyc_res.data[0] if ekyc_res.data else None
+
+        # 4) recent trust history
+        history_res = (
+            supabase.table("trust_score_history")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+
+        # 5) recent trust signals
+        signal_res = (
+            supabase.table("trust_score_signals")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "identity": identity,
+            "permissions": permissions,
+            "latest_verification": latest_verification,
+            "latest_ekyc": latest_ekyc,
+            "recent_trust_history": history_res.data or [],
+            "recent_trust_signals": signal_res.data or []
         }
 
     except HTTPException:
