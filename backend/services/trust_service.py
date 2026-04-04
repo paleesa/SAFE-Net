@@ -1,3 +1,4 @@
+import uuid
 from backend.db.supabase_client import supabase
 
 # ----------------------------
@@ -73,8 +74,10 @@ def recalc_age_score(user_id: str) -> float:
     total = AGE_BASE
     for row in (res.data or []):
         total += float(row["signal_value"])
+        print("RAW TOTAL:", total)
 
     return max(AGE_MIN, min(AGE_MAX, total))
+
 
 
 # ----------------------------
@@ -141,26 +144,36 @@ def update_scores(user_id: str, reason: str = None):
     return new_age_score, new_security_score
 
 # ----------------------------
-# UPDATE ACCESS STATUS (AGE ONLY)
+# UPDATE ACCESS STATUS (TRUST SCORE GATED)
 # ----------------------------
-def update_access_status(user_id: str, predicted_age: float, confidence: float):
+def update_access_status(user_id: str, predicted_age: float = None, confidence: float = None):
+    # Keep predicted_age/confidence params for backward compatibility with callers.
+    # Status transitions are now driven only by trust_score and only when
+    # the current status is under_review.
     res = supabase.table("user_identity") \
-        .select("trust_score") \
+        .select("trust_score, access_status") \
         .eq("user_id", user_id) \
         .single() \
         .execute()
 
-    age_score = float(res.data["trust_score"])
+    current_status = (res.data or {}).get("access_status", "under_review")
+    age_score = float((res.data or {}).get("trust_score", AGE_BASE))
 
-    if predicted_age >= 16 and confidence >= 0.8 and age_score >= 80:
+    # Only review-like states are eligible for automatic transition.
+    # pending is treated as under_review for backward compatibility with existing rows.
+    if current_status not in ["under_review", "pending", None]:
+        return current_status
+
+    if age_score >= 85:
         status = "verified"
-    elif predicted_age < 16 and confidence >= 0.8 and age_score < 50:
+    elif age_score < 35:
         status = "restricted"
     else:
         status = "under_review"
 
-    supabase.table("user_identity").update({
-        "access_status": status
-    }).eq("user_id", user_id).execute()
+    if status != current_status:
+        supabase.table("user_identity").update({
+            "access_status": status
+        }).eq("user_id", user_id).execute()
 
     return status

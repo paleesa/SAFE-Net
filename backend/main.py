@@ -1,4 +1,6 @@
+import uuid
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Body
+from typing import List, Optional
 from PIL import Image
 import os
 import numpy as np
@@ -18,7 +20,7 @@ from backend.services.trust_service import (
     SEC_SIGNAL_LOGIN_MATCH,
     SEC_SIGNAL_LOGIN_FAIL,
 )
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from backend.schemas.guardian import AnalyzeTextRequest
 from backend.schemas.post import CreatePostRequest
 from backend.schemas.comment import CreateCommentRequest
@@ -191,13 +193,21 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     b = b / (np.linalg.norm(b) + 1e-9)
     return float(np.dot(a, b))
 
+from fastapi import Form, File, UploadFile, HTTPException
+from datetime import datetime, timedelta, timezone
+import numpy as np
+import cv2
+from PIL import Image
+
 @app.post("/verify-login")
 async def verify_login(user_id: str = Form(...), file: UploadFile = File(...)):
     try:
-        # 1️⃣ Fetch stored embedding + access_status
+        # ==========================================
+        # 1️⃣ FETCH DATA (No more security score needed!)
+        # ==========================================
         res = (
             supabase.table("user_identity")
-            .select("face_embedding, access_status, security_score")
+            .select("face_embedding, access_status, failed_login_attempts, lockout_until")
             .eq("user_id", user_id)
             .single()
             .execute()
@@ -206,88 +216,88 @@ async def verify_login(user_id: str = Form(...), file: UploadFile = File(...)):
         if not res.data or res.data.get("face_embedding") is None:
             raise HTTPException(status_code=404, detail="No registered face embedding for this user.")
 
+        # ==========================================
+        # 2️⃣ CHECK LOCKOUT STATUS FIRST
+        # ==========================================
+        lockout_until = res.data.get("lockout_until")
+        if lockout_until:
+            lockout_time = datetime.fromisoformat(lockout_until.replace('Z', '+00:00'))
+            now_utc = datetime.now(timezone.utc)
+            
+            if now_utc < lockout_time:
+                remaining_seconds = int((lockout_time - now_utc).total_seconds())
+                return {
+                    "ok": False,
+                    "login_allowed": False,
+                    "reason": f"Too many failed attempts. Please wait {remaining_seconds} seconds."
+                }
+
+        # ==========================================
+        # 3️⃣ RUN THE AI FACE MATH
+        # ==========================================
         stored_list = from_pgvector(res.data["face_embedding"])
         stored = np.array(stored_list, dtype=np.float32)
         access_status = res.data.get("access_status", "pending")
+        failed_attempts = res.data.get("failed_login_attempts", 0)
 
-        # 2️⃣ Live selfie embedding
         img = Image.open(file.file).convert("RGB")
         bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         live = embedder.get_embedding(bgr)
 
-        # 3️⃣ Similarity
         sim = cosine_similarity(stored, live)
-        FACE_MATCH_THRESHOLD= 0.35
+        FACE_MATCH_THRESHOLD = 0.35
         is_match = sim >= FACE_MATCH_THRESHOLD
 
-        # 4️⃣ Insert login attempt
-        la_res = supabase.table("login_attempt").insert({
-            "user_id": user_id,
-            "is_face_match_success": is_match,
-            "face_match_score": round(sim, 4),
+        # Optional: Keep logging the attempt for your database records
+        supabase.table("login_attempt").insert({
+            "user_id": user_id, "is_face_match_success": is_match, "face_match_score": round(sim, 4)
         }).execute()
 
-        attempt_id = la_res.data[0]["attempt_id"]
-
-        # 5️⃣ Insert SECURITY signal
+        # ==========================================
+        # 4️⃣ SUCCESS FLOW
+        # ==========================================
         if is_match:
-            signal_val = SEC_SIGNAL_LOGIN_MATCH
+            # Face matched! Reset the fail counter back to 0.
+            supabase.table("user_identity").update({
+                "failed_login_attempts": 0,
+                "lockout_until": None
+            }).eq("user_id", user_id).execute()
+
+            return {
+                "ok": True, "login_allowed": True, 
+                "access_status": access_status,
+                "similarity": round(sim, 4)
+            }
+
+        # ==========================================
+        # 5️⃣ FAILURE FLOW
+        # ==========================================
         else:
-            signal_val = SEC_SIGNAL_LOGIN_FAIL
+            failed_attempts += 1
+            is_locked_out = failed_attempts >= 3
+            
+            update_data = {"failed_login_attempts": failed_attempts}
+            
+            # 3rd Strike: Set the 1-minute timeout! (Change minutes=1 to minutes=2 if you prefer)
+            if is_locked_out:
+                lockout_time = datetime.now(timezone.utc) + timedelta(minutes=1)
+                update_data["lockout_until"] = lockout_time.isoformat()
+                
+            supabase.table("user_identity").update(update_data).eq("user_id", user_id).execute()
 
-        insert_signal(
-            user_id=user_id,
-            source_type="login",
-            source_id=attempt_id,
-            signal_type="FACE_MATCH",
-            signal_value=signal_val,
-            ai_label="match" if is_match else "mismatch"
-        )
+            if is_locked_out:
+                return {
+                    "ok": False, "login_allowed": False, 
+                    "reason": "Face does not match. You are locked out for 60 seconds.", 
+                    "similarity": round(sim, 4)
+                }
+            else:
+                return {
+                    "ok": False, "login_allowed": False, 
+                    "reason": f"Face does not match. {3 - failed_attempts} attempts remaining.", 
+                    "similarity": round(sim, 4)
+                }
 
-        # 6️⃣ Recalculate scores
-        age_score, security_score = update_scores(user_id,reason="LOGIN_FACE_MATCH" if is_match else "LOGIN_FACE_MISMATCH")
-
-        # 7️⃣ SECURITY enforcement (identity layer)
-        if not is_match:
-            return {
-                "ok": False,
-                "login_allowed": False,
-                "reason": "Face does not match.",
-                "similarity": round(sim, 4),
-                "security_score": security_score
-            }
-
-        if security_score < 30:
-            return {
-                "ok": False,
-                "login_allowed": False,
-                "reason": "Security risk detected. Please reverify identity.",
-                "security_score": security_score
-            }
-
-        # 8️⃣ AGE enforcement (access layer)
-        if access_status == "restricted":
-            return {
-                "ok": True,
-                "login_allowed": True,
-                "access_status": "restricted",
-                "similarity": round(sim, 4),
-                "security_score": security_score
-            }
-
-        # 9️⃣ Normal verified / under_review
-        return {
-            "ok": True,
-            "login_allowed": True,
-            "access_status": access_status,
-            "similarity": round(sim, 4),
-            "security_score": security_score
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
     
@@ -383,13 +393,41 @@ async def analyze_text(req: AnalyzeTextRequest):
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
     
 @app.post("/create-post")
-async def create_post(req: CreatePostRequest):
+async def create_post(
+    user_id: str = Form(...),
+    caption_text: str = Form(...),
+    images: Optional[List[UploadFile]] = File(None) 
+):
     try:
-        # 1️⃣ Save post first
+        media_urls = []
+
+        # 1️⃣ Handle File Upload to Supabase Storage
+        if images:
+            for file in images:
+                # Create a unique filename to prevent overwriting
+                file_extension = file.filename.split(".")[-1]
+                file_name = f"{uuid.uuid4()}.{file_extension}"
+                file_path = f"posts/{user_id}/{file_name}"
+
+                # Read file content
+                file_content = await file.read()
+
+                # Upload to Supabase bucket
+                storage_res = supabase.storage.from_("post-media").upload(
+                    path=file_path,
+                    file=file_content,
+                    file_options={"content-type": file.content_type}
+                )
+
+                # Get Public URL
+                url_res = supabase.storage.from_("post-media").get_public_url(file_path)
+                media_urls.append(url_res)
+
+        # 2️⃣ Save the post first to generate the post_id
+        # Note: We removed 'media_url' from this insert since it moved to the new table
         post_res = supabase.table("post").insert({
-            "user_id": req.user_id,
-            "caption_text": req.caption_text,
-            "media_url": req.media_url
+            "user_id": user_id,
+            "caption_text": caption_text
         }).execute()
 
         if not post_res.data:
@@ -397,17 +435,31 @@ async def create_post(req: CreatePostRequest):
 
         post_id = post_res.data[0]["post_id"]
 
-        # 2️⃣ Run Guardian on caption text
-        result = guardian.predict_text(req.caption_text)
+        # 3️⃣ NEW: Insert all URLs into the post_media table
+        if media_urls:
+            media_insert_data = []
+            for index, url in enumerate(media_urls):
+                media_insert_data.append({
+                    "post_id": post_id,
+                    "media_url": url,
+                    "sort_order": index # Assigns 0, 1, 2, etc. to keep them in order
+                })
+            
+            # Perform a bulk insert to save database trips
+            supabase.table("post_media").insert(media_insert_data).execute()
+
+
+        # 4️⃣ Run Guardian on caption text
+        result = guardian.predict_text(caption_text)
         label = result["predicted_label"]
         conf = float(result["confidence"])
 
-        # 3️⃣ Convert Guardian output into trust signal
+        # 5️⃣ Convert Guardian output into trust signal
         signal_val, signal_type = guardian_signal(label, conf)
 
-        # 4️⃣ Insert signal into trust_score_signals
+        # 6️⃣ Insert signal into trust_score_signals
         insert_signal(
-            user_id=req.user_id,
+            user_id=user_id,
             source_type="post",
             source_id=post_id,
             signal_type=signal_type,
@@ -415,17 +467,17 @@ async def create_post(req: CreatePostRequest):
             ai_label=label
         )
 
-        # 5️⃣ Update age/security scores
+        # 7️⃣ Update age/security scores
         age_score, security_score = update_scores(
-            req.user_id,
+            user_id,
             reason=f"{signal_type}:{label}:{conf:.2f}"
         )
 
-        # 6️⃣ Fetch predicted_age for access status update
+        # 8️⃣ Fetch predicted_age for access status update
         ui_res = (
             supabase.table("user_identity")
             .select("predicted_age")
-            .eq("user_id", req.user_id)
+            .eq("user_id", user_id)
             .single()
             .execute()
         )
@@ -437,9 +489,9 @@ async def create_post(req: CreatePostRequest):
         if predicted_age is None:
             raise HTTPException(status_code=400, detail="predicted_age missing in user_identity")
 
-        # 7️⃣ Update access status
+        # 9️⃣ Update access status
         status = update_access_status(
-            req.user_id,
+            user_id,
             predicted_age=float(predicted_age),
             confidence=conf
         )
@@ -460,7 +512,6 @@ async def create_post(req: CreatePostRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
-    
 @app.post("/create-comment")
 async def create_comment(req: CreateCommentRequest):
     try:
